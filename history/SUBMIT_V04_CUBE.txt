@@ -1,0 +1,385 @@
+#include <cstdint>
+#include <vector>
+#include "acl/acl.h"
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
+#include "kernel_tiling/kernel_tiling.h"
+
+using namespace matmul;
+
+// SUBMISSION_VERSION: V04_CUBE_OVERLAP
+// V04: Cube matrix multiplication with bounded online scalar reduction.
+// Changes against V03_CUBE_TILE:
+//   1. Cube kernel is __aicore__ and ASCENDC_CUBE_ONLY is gone, matching the
+//      official CANN 9.0.0 Matmul example.
+//   2. SetOrgShape uses the four-argument form so a transposed operand gets the
+//      correct leading dimension.
+//   3. Every N block is a full baseN-wide tile. The last block starts at
+//      N - baseN instead of running short, so the tile row stride is always
+//      baseN and the layout of a short tail tile is never relied upon.
+//      Overlapping N columns are safe because the N reduction is a maximum.
+//   4. baseM is raised from 16 to at most 128, which cuts both the B panel
+//      re-reads and the number of cache flushes by up to 8x.
+//   5. Host verifies the returned baseM and baseN before launching. A mismatch
+//      falls back to the scalar path instead of letting the kernel return with
+//      y never written.
+// Tiny workloads retain the previously tested scalar implementation.
+// This file is included by the platform main. Do not add main() here.
+namespace BmmmsStarter {
+
+__aicore__ inline float FloatFromBits(uint32_t bits)
+{
+    union FloatBits {
+        uint32_t bits;
+        float value;
+    } converted;
+    converted.bits = bits;
+    return converted.value;
+}
+
+// Read the actual stored FP16/BF16 values, not the pre-quantization values.
+__aicore__ inline float Decode(uint16_t bits, int32_t dtype)
+{
+    if (dtype == 2) {
+        return FloatFromBits(static_cast<uint32_t>(bits) << 16);
+    }
+
+    const uint32_t sign = (static_cast<uint32_t>(bits) & 0x8000u) << 16;
+    const uint32_t exponent = (bits >> 10) & 0x1fu;
+    const uint32_t fraction = bits & 0x03ffu;
+    if (exponent == 0) {
+        if (fraction == 0) {
+            return FloatFromBits(sign);
+        }
+        // Normalize FP16 subnormals using integer operations only. Ascend C
+        // rejects direct unsigned-integer to floating-point numeric casts.
+        uint32_t normalized = fraction;
+        uint32_t floatExponent = 113u;
+        while ((normalized & 0x0400u) == 0) {
+            normalized <<= 1;
+            --floatExponent;
+        }
+        return FloatFromBits(sign | (floatExponent << 23) |
+                             ((normalized & 0x03ffu) << 13));
+    }
+    if (exponent == 31) {
+        return FloatFromBits(sign | 0x7f800000u | (fraction << 13));
+    }
+    return FloatFromBits(sign | ((exponent + 112u) << 23) | (fraction << 13));
+}
+
+__aicore__ inline void Accumulate(float value, float& sum, float& correction)
+{
+    const float adjusted = value - correction;
+    const float updated = sum + adjusted;
+    correction = (updated - sum) - adjusted;
+    sum = updated;
+}
+
+} // namespace BmmmsStarter
+
+// All input-dependent arithmetic runs on the NPU. A single block avoids
+// cross-core synchronization and multiple writers to one output cache line.
+__global__ __cube__ void bmmms_starter_kernel(
+    GM_ADDR x1, GM_ADDR x2, GM_ADDR y,
+    int64_t B, int64_t M, int64_t N, int64_t K,
+    int32_t dtype, bool transposeX1, bool transposeX2)
+{
+    AscendC::GlobalTensor<uint16_t> x1Gm;
+    AscendC::GlobalTensor<uint16_t> x2Gm;
+    AscendC::GlobalTensor<float> yGm;
+    x1Gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(x1), B * M * K);
+    x2Gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(x2), B * K * N);
+    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), B);
+
+    for (int64_t b = 0; b < B; ++b) {
+        float batchSum = 0.0f;
+        float batchCorrection = 0.0f;
+        const int64_t x1Batch = b * M * K;
+        const int64_t x2Batch = b * K * N;
+
+        for (int64_t m = 0; m < M; ++m) {
+            float rowMax = BmmmsStarter::FloatFromBits(0xff800000u);
+            for (int64_t n = 0; n < N; ++n) {
+                float dot = 0.0f;
+                float dotCorrection = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    const int64_t aIndex = x1Batch +
+                        (transposeX1 ? k * M + m : m * K + k);
+                    const int64_t bIndex = x2Batch +
+                        (transposeX2 ? n * K + k : k * N + n);
+                    const float aValue = BmmmsStarter::Decode(x1Gm.GetValue(aIndex), dtype);
+                    const float bValue = BmmmsStarter::Decode(x2Gm.GetValue(bIndex), dtype);
+                    BmmmsStarter::Accumulate(aValue * bValue, dot, dotCorrection);
+                }
+                if (dot > rowMax) {
+                    rowMax = dot;
+                }
+            }
+            BmmmsStarter::Accumulate(rowMax, batchSum, batchCorrection);
+        }
+        yGm.SetValue(b, batchSum);
+    }
+
+    // Scalar SetValue writes the core data cache. Flush it to global memory.
+    AscendC::DataCacheCleanAndInvalid<float,
+        AscendC::CacheLine::ENTIRE_DATA_CACHE,
+        AscendC::DcciDst::CACHELINE_OUT>(yGm);
+}
+
+// Cube-stage implementation.
+namespace BmmmsCube {
+
+constexpr int32_t TILE_M = 128;
+constexpr int32_t TILE_N = 64;
+constexpr int32_t BLOCK = 16;
+
+__aicore__ inline void CopyTiling(TCubeTiling& tiling, GM_ADDR source)
+{
+    uint32_t* dst = reinterpret_cast<uint32_t*>(&tiling);
+    const __gm__ uint32_t* src = reinterpret_cast<const __gm__ uint32_t*>(source);
+    for (uint32_t i = 0; i < sizeof(TCubeTiling) / sizeof(uint32_t); ++i) {
+        dst[i] = src[i];
+    }
+}
+
+template<typename Input, bool TransA, bool TransB>
+__global__ __aicore__ void bmmms_cube_kernel(
+    GM_ADDR x1, GM_ADDR x2, GM_ADDR y, GM_ADDR tileStorage,
+    __kfc_workspace__ GM_ADDR workspace, GM_ADDR tilingGm,
+    int64_t B, int64_t M, int64_t N, int64_t K)
+{
+    TCubeTiling tiling;
+    CopyTiling(tiling, tilingGm);
+    AscendC::TPipe pipe;
+    AscendC::GlobalTensor<Input> aGm;
+    AscendC::GlobalTensor<Input> bGm;
+    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<float> tileGm;
+    aGm.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x1), B * M * K);
+    bGm.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x2), B * K * N);
+    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), B);
+    tileGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(tileStorage), TILE_M * TILE_N);
+
+    Matmul<MatmulType<AscendC::TPosition::GM, CubeFormat::ND, Input, TransA>,
+           MatmulType<AscendC::TPosition::GM, CubeFormat::ND, Input, TransB>,
+           MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>> mm;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &tiling);
+
+    const int64_t bm = tiling.baseM;
+    const int64_t bn = tiling.baseN;
+    // Host already verified these and guarantees bn <= N, so this guard is not
+    // reachable. It stays because the kernel indexes a bounded tile buffer.
+    if (bm < 1 || bm > TILE_M || bn < 1 || bn > TILE_N || N < bn) {
+        return;
+    }
+
+    for (int64_t batch = 0; batch < B; ++batch) {
+        float batchSum = 0.0f;
+        float batchCorrection = 0.0f;
+        for (int64_t m0 = 0; m0 < M; m0 += bm) {
+            const int32_t validM = static_cast<int32_t>((M - m0 < bm) ? M - m0 : bm);
+            float maxima[TILE_M];
+            for (int32_t r = 0; r < validM; ++r) {
+                maxima[r] = BmmmsStarter::FloatFromBits(0xff800000u);
+            }
+            for (int64_t n0 = 0; n0 < N; n0 += bn) {
+                // Full-width tiles only. The final block slides back to
+                // N - bn; re-reading those columns cannot change a maximum.
+                const int64_t nStart = (n0 + bn <= N) ? n0 : (N - bn);
+                const int64_t aOffset = batch * M * K + (TransA ? m0 : m0 * K);
+                const int64_t bOffset = batch * K * N + (TransB ? nStart * K : nStart);
+                mm.SetOrgShape(static_cast<int32_t>(M), static_cast<int32_t>(N),
+                               static_cast<int32_t>(K), static_cast<int32_t>(K));
+                mm.SetTensorA(aGm[aOffset], TransA);
+                mm.SetTensorB(bGm[bOffset], TransB);
+                mm.SetTail(validM, static_cast<int32_t>(bn), static_cast<int32_t>(K));
+                while (mm.Iterate()) {
+                    // Sequential output is one baseM x baseN tile, independent
+                    // of the full input matrix strides. No full C is allocated.
+                    mm.GetTensorC(tileGm, 0, true);
+                    AscendC::DataCacheCleanAndInvalid<float,
+                        AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                        AscendC::DcciDst::CACHELINE_OUT>(tileGm);
+                    for (int32_t r = 0; r < validM; ++r) {
+                        float best = maxima[r];
+                        const int64_t rowBase = static_cast<int64_t>(r) * bn;
+                        for (int32_t c = 0; c < static_cast<int32_t>(bn); ++c) {
+                            const float value = tileGm.GetValue(rowBase + c);
+                            if (value > best) {
+                                best = value;
+                            }
+                        }
+                        maxima[r] = best;
+                    }
+                }
+                mm.End();
+            }
+            for (int32_t r = 0; r < validM; ++r) {
+                BmmmsStarter::Accumulate(maxima[r], batchSum, batchCorrection);
+            }
+        }
+        yGm.SetValue(batch, batchSum);
+    }
+    AscendC::DataCacheCleanAndInvalid<float,
+        AscendC::CacheLine::ENTIRE_DATA_CACHE,
+        AscendC::DcciDst::CACHELINE_OUT>(yGm);
+}
+
+template<typename Input>
+inline void Launch(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, GM_ADDR tile,
+                   GM_ADDR workspace, GM_ADDR tiling, aclrtStream stream,
+                   int64_t B, int64_t M, int64_t N, int64_t K, bool ta, bool tb)
+{
+    if (ta) {
+        if (tb) {
+            bmmms_cube_kernel<Input, true, true><<<1, nullptr, stream>>>(
+                x1, x2, y, tile, workspace, tiling, B, M, N, K);
+        } else {
+            bmmms_cube_kernel<Input, true, false><<<1, nullptr, stream>>>(
+                x1, x2, y, tile, workspace, tiling, B, M, N, K);
+        }
+    } else if (tb) {
+        bmmms_cube_kernel<Input, false, true><<<1, nullptr, stream>>>(
+            x1, x2, y, tile, workspace, tiling, B, M, N, K);
+    } else {
+        bmmms_cube_kernel<Input, false, false><<<1, nullptr, stream>>>(
+            x1, x2, y, tile, workspace, tiling, B, M, N, K);
+    }
+}
+
+// Returns false only before launching, so fallback never adds a second kernel.
+inline bool TryRun(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, aclrtStream stream,
+                   int64_t B, int64_t M, int64_t N, int64_t K,
+                   int32_t dtype, bool ta, bool tb)
+{
+    // A Cube basic block is a multiple of 16 wide, so N < 16 cannot be covered
+    // by full-width tiles. Those shapes use the already verified scalar path
+    // rather than depending on how a short tail tile is laid out.
+    const int32_t boundedN = (N < TILE_N) ? static_cast<int32_t>(N) : TILE_N;
+    const int32_t baseN = (boundedN / BLOCK) * BLOCK;
+    if (baseN < BLOCK) {
+        return false;
+    }
+    const int32_t roundedM = static_cast<int32_t>(((M + BLOCK - 1) / BLOCK) * BLOCK);
+    const int32_t baseM = (roundedM < TILE_M) ? roundedM : TILE_M;
+
+    const char* socName = aclrtGetSocName();
+    if (socName == nullptr) {
+        return false;
+    }
+    auto platform = platform_ascendc::PlatformAscendCManager::GetInstance(socName);
+    if (platform == nullptr) {
+        return false;
+    }
+    matmul_tiling::MatmulApiTiling tiler(*platform);
+    const auto inputType = dtype == 1 ? matmul_tiling::DataType::DT_FLOAT16 :
+                                       matmul_tiling::DataType::DT_BF16;
+    tiler.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, inputType, ta);
+    tiler.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, inputType, tb);
+    tiler.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT);
+    tiler.SetOrgShape(static_cast<int32_t>(M), static_cast<int32_t>(N), static_cast<int32_t>(K));
+    tiler.SetShape(baseM, baseN, static_cast<int32_t>(K));
+    if (tiler.SetFixSplit(baseM, baseN, -1) != 0) {
+        return false;
+    }
+    tiler.SetBias(false);
+    tiler.SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling hostTiling;
+    if (tiler.GetTiling(hostTiling) < 0) {
+        return false;
+    }
+    const size_t tilingBytes = hostTiling.GetDataSize();
+    std::vector<uint8_t> serialized(tilingBytes);
+    hostTiling.SaveToBuffer(serialized.data(), tilingBytes);
+    // The kernel reads a bounded tile buffer using these two values. Confirm
+    // them here; a mismatch must fall back before any kernel is launched.
+    if (tilingBytes < sizeof(TCubeTiling)) {
+        return false;
+    }
+    const TCubeTiling* resolved = reinterpret_cast<const TCubeTiling*>(serialized.data());
+    if (resolved->baseM != baseM || resolved->baseN != baseN) {
+        return false;
+    }
+
+    const size_t systemBytes = static_cast<size_t>(platform->GetLibApiWorkSpaceSize());
+    const size_t tilingOffset = (systemBytes + 511u) & ~size_t(511u);
+    const size_t tileOffset = (tilingOffset + tilingBytes + 511u) & ~size_t(511u);
+    const size_t totalBytes = tileOffset + static_cast<size_t>(TILE_M) * TILE_N * sizeof(float);
+    uint8_t* storage = nullptr;
+    if (aclrtMalloc(reinterpret_cast<void**>(&storage), totalBytes,
+                    ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+        return false;
+    }
+    uint8_t* tilingDevice = storage + tilingOffset;
+    uint8_t* tileDevice = storage + tileOffset;
+    if (aclrtMemcpy(tilingDevice, tilingBytes, serialized.data(), tilingBytes,
+                    ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+        aclrtFree(storage);
+        return false;
+    }
+    if (dtype == 1) {
+        Launch<half>(x1, x2, y, tileDevice, storage, tilingDevice, stream, B, M, N, K, ta, tb);
+    } else {
+        Launch<bfloat16_t>(x1, x2, y, tileDevice, storage, tilingDevice, stream, B, M, N, K, ta, tb);
+    }
+    // Per-call storage must remain live until its kernel completes. Keep the
+    // same 3000 ms wait used by the template, and never reuse prior results.
+    // If the wait does not complete the kernel may still be reading storage,
+    // so it is deliberately not freed here; releasing it would be a
+    // use-after-free on a running kernel.
+    if (aclrtSynchronizeStreamWithTimeout(stream, 3000) == ACL_SUCCESS) {
+        aclrtFree(storage);
+    }
+    return true;
+}
+
+} // namespace BmmmsCube
+
+
+extern "C" void run_kernel(
+    GM_ADDR x1, const TensorGroupInfo& info_x1,
+    GM_ADDR x2, const TensorGroupInfo& info_x2,
+    GM_ADDR y, const TensorGroupInfo& info_y,
+    int64_t availableCoreNum, aclrtStream stream,
+    bool transposeX1, bool transposeX2)
+{
+    // Host accesses tensor metadata only, never tensor values.
+    if (!x1 || !x2 || !y || availableCoreNum <= 0 ||
+        !info_x1.tensors || !info_x2.tensors || !info_y.tensors ||
+        info_x1.numTensors != 1 || info_x2.numTensors != 1 || info_y.numTensors != 1) {
+        return;
+    }
+    const TensorInfo& a = info_x1.tensors[0];
+    const TensorInfo& b = info_x2.tensors[0];
+    const TensorInfo& out = info_y.tensors[0];
+    if (!a.shape || !b.shape || !out.shape || a.numDims != 3 ||
+        b.numDims != 3 || out.numDims != 1 ||
+        (a.dtype != 1 && a.dtype != 2) || a.dtype != b.dtype || out.dtype != 0) {
+        return;
+    }
+
+    const int64_t B = a.shape[0];
+    const int64_t M = a.shape[transposeX1 ? 2 : 1];
+    const int64_t K = a.shape[transposeX1 ? 1 : 2];
+    const int64_t K2 = b.shape[transposeX2 ? 2 : 1];
+    const int64_t N = b.shape[transposeX2 ? 1 : 2];
+    if (B < 1 || B > 64 || M < 1 || M > 8192 || N < 1 || N > 8192 ||
+        K < 32 || K > 8192 || K % 8 != 0 || K != K2 ||
+        b.shape[0] != B || out.shape[0] != B ||
+        B * M * K > (int64_t(1) << 26) || B * N * K > (int64_t(1) << 26)) {
+        return;
+    }
+
+    // Workload-based dispatch; both paths compute the full actual inputs.
+    if (B * M * N * K > 4096 &&
+        BmmmsCube::TryRun(x1, x2, y, stream, B, M, N, K, a.dtype, transposeX1, transposeX2)) {
+        return;
+    }
+    // Exactly one launch is used for each invocation.
+    bmmms_starter_kernel<<<1, nullptr, stream>>>(
+        x1, x2, y, B, M, N, K, a.dtype, transposeX1, transposeX2);
+}

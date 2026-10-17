@@ -1,0 +1,1339 @@
+#include <cstdint>
+#include <vector>
+#include "acl/acl.h"
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
+#include "kernel_tiling/kernel_tiling.h"
+
+using namespace matmul;
+
+// SUBMISSION_VERSION: V36_TINY_OUTPUT_VECTOR
+namespace BmmmsStarter {
+
+__aicore__ inline float FloatFromBits(uint32_t bits)
+{
+    union FloatBits {
+        uint32_t bits;
+        float value;
+    } converted;
+    converted.bits = bits;
+    return converted.value;
+}
+__aicore__ inline float Decode(uint16_t bits, int32_t dtype)
+{
+    if (dtype == 2) {
+        return FloatFromBits(static_cast<uint32_t>(bits) << 16);
+    }
+
+    const uint32_t sign = (static_cast<uint32_t>(bits) & 0x8000u) << 16;
+    const uint32_t exponent = (bits >> 10) & 0x1fu;
+    const uint32_t fraction = bits & 0x03ffu;
+    if (exponent == 0) {
+        if (fraction == 0) {
+            return FloatFromBits(sign);
+        }
+        uint32_t normalized = fraction;
+        uint32_t floatExponent = 113u;
+        while ((normalized & 0x0400u) == 0) {
+            normalized <<= 1;
+            --floatExponent;
+        }
+        return FloatFromBits(sign | (floatExponent << 23) |
+                             ((normalized & 0x03ffu) << 13));
+    }
+    if (exponent == 31) {
+        return FloatFromBits(sign | 0x7f800000u | (fraction << 13));
+    }
+    return FloatFromBits(sign | ((exponent + 112u) << 23) | (fraction << 13));
+}
+
+__aicore__ inline void Accumulate(float value, float& sum, float& correction)
+{
+    const float adjusted = value - correction;
+    const float updated = sum + adjusted;
+    correction = (updated - sum) - adjusted;
+    sum = updated;
+}
+
+} // namespace BmmmsStarter
+__global__ __cube__ void bmmms_starter_kernel(
+    GM_ADDR x1, GM_ADDR x2, GM_ADDR y,
+    int64_t B, int64_t M, int64_t N, int64_t K,
+    int32_t dtype, bool transposeX1, bool transposeX2)
+{
+    AscendC::GlobalTensor<uint16_t> x1Gm;
+    AscendC::GlobalTensor<uint16_t> x2Gm;
+    AscendC::GlobalTensor<float> yGm;
+    x1Gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(x1), B * M * K);
+    x2Gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(x2), B * K * N);
+    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), B);
+
+    for (int64_t b = 0; b < B; ++b) {
+        float batchSum = 0.0f;
+        float batchCorrection = 0.0f;
+        const int64_t x1Batch = b * M * K;
+        const int64_t x2Batch = b * K * N;
+
+        for (int64_t m = 0; m < M; ++m) {
+            float rowMax = BmmmsStarter::FloatFromBits(0xff800000u);
+            for (int64_t n = 0; n < N; ++n) {
+                float dot = 0.0f;
+                float dotCorrection = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    const int64_t aIndex = x1Batch +
+                        (transposeX1 ? k * M + m : m * K + k);
+                    const int64_t bIndex = x2Batch +
+                        (transposeX2 ? n * K + k : k * N + n);
+                    const float aValue = BmmmsStarter::Decode(x1Gm.GetValue(aIndex), dtype);
+                    const float bValue = BmmmsStarter::Decode(x2Gm.GetValue(bIndex), dtype);
+                    BmmmsStarter::Accumulate(aValue * bValue, dot, dotCorrection);
+                }
+                if (dot > rowMax) {
+                    rowMax = dot;
+                }
+            }
+            BmmmsStarter::Accumulate(rowMax, batchSum, batchCorrection);
+        }
+        yGm.SetValue(b, batchSum);
+    }
+    AscendC::DataCacheCleanAndInvalid<float,
+        AscendC::CacheLine::ENTIRE_DATA_CACHE,
+        AscendC::DcciDst::CACHELINE_OUT>(yGm);
+}
+template<typename Input>
+__global__ __aicore__ void bmmms_dot_kernel(
+    GM_ADDR x1,GM_ADDR x2,GM_ADDR y,int64_t B,int32_t K)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ab,bb,afb,bfb,ob;
+    const int32_t paddedK=((K+15)/16)*16;
+    pipe.InitBuffer(ab,paddedK*2); pipe.InitBuffer(bb,paddedK*2);
+    pipe.InitBuffer(afb,paddedK*4); pipe.InitBuffer(bfb,paddedK*4); pipe.InitBuffer(ob,32);
+    auto al=ab.Get<Input>(),bl=bb.Get<Input>();
+    auto af=afb.Get<float>(),bf=bfb.Get<float>(),one=ob.Get<float>();
+    AscendC::GlobalTensor<Input> ag,bg;
+    AscendC::GlobalTensor<float> yg;
+    ag.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x1),B*K);
+    bg.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x2),B*K);
+    yg.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y),B);
+    AscendC::DataCopyExtParams cp{1,static_cast<uint32_t>(K*2),0,0,0};
+    AscendC::DataCopyPadExtParams<Input> pad{false,0,0,0};
+    for(int64_t b=AscendC::GetBlockIdx();b<B;b+=AscendC::GetBlockNum()) {
+        AscendC::DataCopyPad(al,ag[b*K],cp,pad);
+        AscendC::DataCopyPad(bl,bg[b*K],cp,pad);
+        auto me=pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(me);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(me);
+        AscendC::Cast(af,al,AscendC::RoundMode::CAST_NONE,K);
+        AscendC::Cast(bf,bl,AscendC::RoundMode::CAST_NONE,K);
+        if(B>1) {
+            auto reuse=pipe.FetchEventID<AscendC::HardEvent::V_MTE2>();
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(reuse);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(reuse);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(af,af,bf,K);
+        AscendC::PipeBarrier<PIPE_V>();
+        if(K<=64) AscendC::WholeReduceSum(one,af,K,1,1,1,8);
+        else AscendC::ReduceSum(one,af,bf,K);
+        if(B==1) {
+            auto se=pipe.FetchEventID<AscendC::HardEvent::V_S>();
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(se);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(se);
+            yg.SetValue(b,one.GetValue(0));
+        } else {
+            auto se=pipe.FetchEventID<AscendC::HardEvent::V_MTE3>();
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(se);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(se);
+            AscendC::DataCopyExtParams cpOut{1,4,0,0,0};
+            AscendC::DataCopyPad(yg[b],one,cpOut);
+            auto done=pipe.FetchEventID<AscendC::HardEvent::MTE3_V>();
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(done);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(done);
+        }
+    }
+    if(B==1) AscendC::DataCacheCleanAndInvalid<float,AscendC::CacheLine::ENTIRE_DATA_CACHE,
+        AscendC::DcciDst::CACHELINE_OUT>(yg);
+}
+
+
+template<typename Input>
+__global__ __aicore__ void bmmms_tiny_dots_kernel(
+    GM_ADDR x1,GM_ADDR x2,GM_ADDR y,int64_t B,int32_t M,int32_t N,int32_t K,bool ta,bool tb)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::TPipe pipe;
+    const int32_t capacity=(K>4096)?4096:((K+15)/16)*16;
+    const bool gatherA=ta && M>1,gatherB=!tb && N>1;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ar,br,afBuf,bfBuf,prodBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> at,bt,ai,bi,partialBuf,workBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> oneBuf,tailBuf,totalsBuf,rowBuf,resultBuf;
+    pipe.InitBuffer(ar,M*capacity*2); pipe.InitBuffer(br,N*capacity*2);
+    pipe.InitBuffer(afBuf,M*capacity*4); pipe.InitBuffer(bfBuf,N*capacity*4);
+    pipe.InitBuffer(prodBuf,capacity*4);
+    auto af=afBuf.Get<float>(),bf=bfBuf.Get<float>(),product=prodBuf.Get<float>();
+    AscendC::LocalTensor<float> ga,gb;
+    AscendC::LocalTensor<int32_t> ia,ib;
+    if(gatherA) {
+        pipe.InitBuffer(at,capacity*4); pipe.InitBuffer(ai,capacity*4);
+        ga=at.Get<float>(); ia=ai.Get<int32_t>();
+        AscendC::CreateVecIndex(ia,int32_t(0),capacity);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(ia,ia,M*4,capacity);
+    }
+    if(gatherB) {
+        pipe.InitBuffer(bt,capacity*4); pipe.InitBuffer(bi,capacity*4);
+        gb=bt.Get<float>(); ib=bi.Get<int32_t>();
+        AscendC::CreateVecIndex(ib,int32_t(0),capacity);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(ib,ib,N*4,capacity);
+    }
+    pipe.InitBuffer(partialBuf,((capacity/64+7)/8+1)*32);
+    pipe.InitBuffer(workBuf,1024); pipe.InitBuffer(oneBuf,32); pipe.InitBuffer(tailBuf,32);
+    pipe.InitBuffer(totalsBuf,M*N*32); pipe.InitBuffer(rowBuf,32); pipe.InitBuffer(resultBuf,32);
+    auto partial=partialBuf.Get<float>(),work=workBuf.Get<float>(),one=oneBuf.Get<float>();
+    auto tail=tailBuf.Get<float>(),totals=totalsBuf.Get<float>(),rowMax=rowBuf.Get<float>();
+    auto result=resultBuf.Get<float>();
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::GlobalTensor<Input> ag,bg;
+    AscendC::GlobalTensor<float> yg;
+    ag.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x1),B*M*K);
+    bg.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x2),B*N*K);
+    yg.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y),B);
+    for(int64_t b=AscendC::GetBlockIdx();b<B;b+=AscendC::GetBlockNum()) {
+        for(int32_t k0=0;k0<K;k0+=capacity) {
+            const int32_t length=(K-k0<capacity)?K-k0:capacity;
+            const int32_t pitch=((length+15)/16)*16;
+            AscendC::DataCopyExtParams ac{static_cast<uint16_t>(ta?1:M),
+                static_cast<uint32_t>((ta?M:1)*length*2),
+                static_cast<uint32_t>(ta?0:(K-length)*2),0,0};
+            AscendC::DataCopyExtParams bc{static_cast<uint16_t>(tb?N:1),
+                static_cast<uint32_t>((tb?1:N)*length*2),
+                static_cast<uint32_t>(tb?(K-length)*2:0),0,0};
+            AscendC::DataCopyPadExtParams<Input> pa{true,0,static_cast<uint8_t>(ta?0:pitch-length),0};
+            AscendC::DataCopyPadExtParams<Input> pb{true,0,static_cast<uint8_t>(tb?pitch-length:0),0};
+            auto al=ar.Get<Input>(),bl=br.Get<Input>();
+            AscendC::DataCopyPad(al,ag[b*M*K+(ta?k0*M:k0)],ac,pa);
+            AscendC::DataCopyPad(bl,bg[b*N*K+(tb?k0:k0*N)],bc,pb);
+            auto ready=pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ready);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ready);
+            AscendC::Cast(af,al,AscendC::RoundMode::CAST_NONE,M*(ta?length:pitch));
+            AscendC::Cast(bf,bl,AscendC::RoundMode::CAST_NONE,N*(tb?pitch:length));
+            auto reuse=pipe.FetchEventID<AscendC::HardEvent::V_MTE2>();
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(reuse);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(reuse);
+            AscendC::PipeBarrier<PIPE_V>();
+            for(int32_t m=0;m<M;++m) {
+                auto av=af[m*pitch];
+                if(gatherA) {
+                    AscendC::Gather(ga,af,ai.Get<uint32_t>(),m*4,length);
+                    av=ga;
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                for(int32_t n=0;n<N;++n) {
+                    auto bv=bf[n*pitch];
+                    if(gatherB) {
+                        AscendC::Gather(gb,bf,bi.Get<uint32_t>(),n*4,length);
+                        bv=gb;
+                        AscendC::PipeBarrier<PIPE_V>();
+                    }
+                    AscendC::Mul(product,av,bv,length);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    const int32_t full=length/64,rem=length%64;
+                    if(full>0) {
+                        AscendC::WholeReduceSum(partial,product,64,full,1,1,8);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::ReduceSum(one,partial,work,full);
+                    }
+                    if(rem>0) {
+                        AscendC::WholeReduceSum(tail,product[full*64],rem,1,1,1,8);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        if(full>0) AscendC::Add(one,one,tail,1);
+                        else AscendC::Adds(one,tail,0.0f,1);
+                    }
+                    AscendC::PipeBarrier<PIPE_V>();
+                    const int32_t index=(m*N+n)*8;
+                    if(k0==0) AscendC::Adds(totals[index],one,0.0f,1);
+                    else AscendC::Add(totals[index],totals[index],one,1);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+            }
+        }
+        for(int32_t m=0;m<M;++m) {
+            AscendC::Adds(rowMax,totals[m*N*8],0.0f,1);
+            AscendC::PipeBarrier<PIPE_V>();
+            for(int32_t n=1;n<N;++n) {
+                AscendC::Max(rowMax,rowMax,totals[(m*N+n)*8],1);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            if(m==0) AscendC::Adds(result,rowMax,0.0f,1);
+            else AscendC::Add(result,result,rowMax,1);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        auto write=pipe.FetchEventID<AscendC::HardEvent::V_MTE3>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(write);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(write);
+        AscendC::DataCopyExtParams yc{1,4,0,0,0};
+        AscendC::DataCopyPad(yg[b],result,yc);
+        auto written=pipe.FetchEventID<AscendC::HardEvent::MTE3_V>();
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(written);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(written);
+    }
+}
+
+
+template<typename Input>
+__global__ __aicore__ void bmmms_small_vector_kernel(
+    GM_ADDR x1, GM_ADDR x2, GM_ADDR y, int64_t B,
+    int32_t M, int32_t N, int32_t K, bool ta, bool tb)
+{
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> aq, bq;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> afBuf, bfBuf, apBuf, bpBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> productBuf, workBuf, oaBuf, obBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> dotBuf, maxBuf, sumBuf;
+    const int32_t mk = M * K, nk = N * K;
+    pipe.InitBuffer(aq, 1, ((mk + 15) / 16) * 32);
+    pipe.InitBuffer(bq, 1, ((nk + 15) / 16) * 32);
+    pipe.InitBuffer(afBuf, mk * 4); pipe.InitBuffer(bfBuf, nk * 4);
+    pipe.InitBuffer(apBuf, K * 4); pipe.InitBuffer(bpBuf, K * 4);
+    pipe.InitBuffer(productBuf, K * 4); pipe.InitBuffer(workBuf, K * 4);
+    pipe.InitBuffer(oaBuf, K * 4); pipe.InitBuffer(obBuf, K * 4);
+    pipe.InitBuffer(dotBuf, 32); pipe.InitBuffer(maxBuf, 32); pipe.InitBuffer(sumBuf, 32);
+    auto af = afBuf.Get<float>(); auto bf = bfBuf.Get<float>();
+    auto ap = apBuf.Get<float>(); auto bp = bpBuf.Get<float>();
+    auto product = productBuf.Get<float>(); auto work = workBuf.Get<float>();
+    auto dot = dotBuf.Get<float>(); auto rowMax = maxBuf.Get<float>();
+    auto total = sumBuf.Get<float>();
+    auto oa = oaBuf.Get<int32_t>(); auto ob = obBuf.Get<int32_t>();
+    AscendC::CreateVecIndex(oa, int32_t(0), K);
+    AscendC::CreateVecIndex(ob, int32_t(0), K);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls(oa, oa, M * 4, K); AscendC::Muls(ob, ob, N * 4, K);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::GlobalTensor<Input> ag, bg;
+    AscendC::GlobalTensor<float> yg;
+    ag.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x1), B * mk);
+    bg.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x2), B * nk);
+    yg.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), B);
+    AscendC::DataCopyExtParams ac{1, static_cast<uint32_t>(mk * 2), 0, 0, 0};
+    AscendC::DataCopyExtParams bc{1, static_cast<uint32_t>(nk * 2), 0, 0, 0};
+    AscendC::DataCopyPadExtParams<Input> pad{false, 0, 0, 0};
+    for (int64_t batch = 0; batch < B; ++batch) {
+        auto al = aq.AllocTensor<Input>(); auto bl = bq.AllocTensor<Input>();
+        AscendC::DataCopyPad(al, ag[batch * mk], ac, pad);
+        AscendC::DataCopyPad(bl, bg[batch * nk], bc, pad);
+        aq.EnQue(al); bq.EnQue(bl);
+        al = aq.DeQue<Input>(); bl = bq.DeQue<Input>();
+        AscendC::Cast(af, al, AscendC::RoundMode::CAST_NONE, mk);
+        AscendC::Cast(bf, bl, AscendC::RoundMode::CAST_NONE, nk);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (int32_t m = 0; m < M; ++m) {
+            for (int32_t n = 0; n < N; ++n) {
+                auto av = af[m * K]; auto bv = bf[n * K];
+                if (ta) {
+                    AscendC::Gather(ap, af, oa.ReinterpretCast<uint32_t>(), m * 4, K);
+                    av = ap;
+                }
+                if (!tb) {
+                    AscendC::Gather(bp, bf, ob.ReinterpretCast<uint32_t>(), n * 4, K);
+                    bv = bp;
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mul(product, av, bv, K);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::ReduceSum(dot, product, work, K);
+                AscendC::PipeBarrier<PIPE_V>();
+                if (n == 0) {
+                    AscendC::Adds(rowMax, dot, 0.0f, 1);
+                } else {
+                    AscendC::Max(rowMax, rowMax, dot, 1);
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            if (m == 0) {
+                AscendC::Adds(total, rowMax, 0.0f, 1);
+            } else {
+                AscendC::Add(total, total, rowMax, 1);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        auto ev = pipe.FetchEventID<AscendC::HardEvent::V_S>();
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(ev);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(ev);
+        yg.SetValue(batch, total.GetValue(0));
+        aq.FreeTensor(al); bq.FreeTensor(bl);
+    }
+    AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+        AscendC::DcciDst::CACHELINE_OUT>(yg);
+}
+namespace BmmmsCube {
+
+constexpr int32_t TILE_M = 512;
+constexpr int32_t TILE_N = 256;
+constexpr int32_t BLOCK = 16;
+constexpr int32_t SLOT = 16;
+
+__aicore__ inline void CopyTiling(TCubeTiling& tiling, GM_ADDR source)
+{
+    uint32_t* dst = reinterpret_cast<uint32_t*>(&tiling);
+    const __gm__ uint32_t* src = reinterpret_cast<const __gm__ uint32_t*>(source);
+    for (uint32_t i = 0; i < sizeof(TCubeTiling) / sizeof(uint32_t); ++i) {
+        dst[i] = src[i];
+    }
+}
+
+template<typename Input, bool TransA, bool TransB>
+__global__ __aicore__ void bmmms_cube_kernel(
+    GM_ADDR x1, GM_ADDR x2, GM_ADDR y, GM_ADDR tileStorage, GM_ADDR chunkStorage,
+    __kfc_workspace__ GM_ADDR workspace, GM_ADDR tilingGm, GM_ADDR paddedA, GM_ADDR paddedB, GM_ADDR packingMap, int64_t packingRows,
+    int64_t B, int64_t M, int64_t N, int64_t K,
+    int64_t mChunks, int64_t chunkCount, int64_t usedCores, int64_t tileStride, int64_t nShards)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+    TCubeTiling tiling;
+    CopyTiling(tiling, tilingGm);
+    AscendC::TPipe pipe;
+    const int64_t bm=tiling.baseM, bn=tiling.baseN;
+    const int64_t core=AscendC::GetBlockIdx();
+    AscendC::GlobalTensor<float> tileGm, chunks, output;
+    tileGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(tileStorage), usedCores*tileStride);
+    chunks.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(chunkStorage), chunkCount*((nShards>1)?bm:SLOT));
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), B);
+    auto myTile=tileGm[core*tileStride];
+
+    const int64_t pitchM=paddedA?((M+15)/16)*16:M;
+    const int64_t pitchN=paddedB?((N+15)/16)*16:N;
+    if(paddedA || paddedB) {
+        if ASCEND_IS_AIV {
+            const int64_t aw=paddedA?pitchM:0,bw=paddedB?pitchN:0;
+            const int64_t widest=(aw>bw)?aw:bw;
+            AscendC::TBuf<AscendC::TPosition::VECCALC> raw,out,indices;
+            pipe.InitBuffer(raw,packingRows*widest*sizeof(Input)+32);
+            pipe.InitBuffer(out,packingRows*widest*sizeof(Input));
+            pipe.InitBuffer(indices,packingRows*widest*sizeof(uint32_t));
+            auto inputLocal=raw.Get<Input>(),outputLocal=out.Get<Input>();
+            auto offsets=indices.Get<uint32_t>();
+            auto rawBits=raw.Get<half>(),outBits=out.Get<half>();
+            const int64_t sentinel=packingRows*widest;
+            AscendC::Duplicate(rawBits[sentinel],half(0.0f),16);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::GlobalTensor<uint32_t> maps;
+            maps.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(packingMap),
+                packingRows*(aw+bw));
+            const int64_t begin=core*(B*K)/usedCores;
+            const int64_t end=(core+1)*(B*K)/usedCores;
+            for(int32_t which=0;which<2;++which) {
+                GM_ADDR destination=(which==0)?paddedA:paddedB;
+                if(!destination) continue;
+                const int64_t width=(which==0)?M:N;
+                const int64_t pitch=(which==0)?pitchM:pitchN;
+                AscendC::GlobalTensor<Input> input,packed;
+                input.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>((which==0)?x1:x2),B*K*width);
+                packed.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(destination),B*K*pitch);
+                AscendC::DataCopy(offsets,maps[(which==0)?0:packingRows*aw],packingRows*pitch);
+                for(int64_t row=begin;row<end;row+=packingRows) {
+                    const int32_t count=static_cast<int32_t>((end-row<packingRows)?end-row:packingRows);
+                    AscendC::DataCopyExtParams read{1,static_cast<uint32_t>(count*width*sizeof(Input)),0,0,0};
+                    AscendC::DataCopyPadExtParams<Input> pad{false,0,0,0};
+                    AscendC::DataCopyPad(inputLocal,input[row*width],read,pad);
+                    auto ready=pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ready);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ready);
+                    AscendC::Gather(outBits,rawBits,offsets,0,count*pitch);
+                    auto reuse=pipe.FetchEventID<AscendC::HardEvent::V_MTE2>();
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(reuse);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(reuse);
+                    auto write=pipe.FetchEventID<AscendC::HardEvent::V_MTE3>();
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(write);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(write);
+                    AscendC::DataCopy(packed[row*pitch],outputLocal,count*pitch);
+                    auto done=pipe.FetchEventID<AscendC::HardEvent::MTE3_V>();
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(done);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(done);
+                }
+            }
+            AscendC::CrossCoreSetFlag<2,PIPE_MTE3>(8);
+        }
+        if ASCEND_IS_AIC { AscendC::CrossCoreWaitFlag<2>(8); }
+        if(usedCores>1) AscendC::SyncAll();
+        if ASCEND_IS_AIV { pipe.Reset(); }
+    }
+    int64_t ordinal=0;
+    if ASCEND_IS_AIC {
+        AscendC::GlobalTensor<Input> ag,bg;
+        ag.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(paddedA?paddedA:x1),B*pitchM*K);
+        bg.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(paddedB?paddedB:x2),B*K*pitchN);
+        using AT=MatmulType<AscendC::TPosition::GM,CubeFormat::ND,Input,TransA>;
+        using BT=MatmulType<AscendC::TPosition::GM,CubeFormat::ND,Input,TransB>;
+        using CT=MatmulType<AscendC::TPosition::GM,CubeFormat::ND,float>;
+        AscendC::MatmulImpl<AT,BT,CT> mm;
+        mm.Init(&tiling,&pipe);
+        for(int64_t chunk=core;chunk<chunkCount;chunk+=usedCores) {
+            const int64_t rowChunk=chunk/nShards;
+            const int64_t batch=rowChunk/mChunks, m0=(rowChunk%mChunks)*bm;
+            const int32_t validM=static_cast<int32_t>((M-m0<bm)?M-m0:bm);
+            const int64_t tileCount=(N+bn-1)/bn;
+            const int64_t shard=chunk%nShards;
+            const int64_t tileBegin=shard*tileCount/nShards;
+            const int64_t tileEnd=(shard+1)*tileCount/nShards;
+            const int64_t fullTiles=N/bn;
+            const int64_t fullEnd=(tileEnd<fullTiles)?tileEnd:fullTiles;
+            const int32_t sessions=(tileEnd>fullTiles && N%bn!=0)?2:1;
+            for(int32_t session=0;session<sessions;++session) {
+                const bool tail=session==1;
+                if(!tail && tileBegin>=fullEnd) continue;
+                const int64_t ns=tail?((N<bn)?0:N-bn):tileBegin*bn;
+                const int64_t countN=tail?((N<bn)?N:bn):(fullEnd-tileBegin)*bn;
+                mm.SetOrgShape(pitchM,pitchN,K,K);
+                mm.SetTensorA(ag[batch*pitchM*K+(TransA?m0:m0*K)],TransA);
+                mm.SetTensorB(bg[batch*K*pitchN+(TransB?ns*K:ns)],TransB);
+                mm.SetTail(validM,countN,K);
+                while(mm.Iterate()) {
+                    const int32_t slot=ordinal%2;
+                    if(ordinal>=2) AscendC::CrossCoreWaitFlag<2>(6+slot);
+                    mm.GetTensorC(myTile[slot*bm*bn],0,true);
+                    AscendC::CrossCoreSetFlag<2,PIPE_FIX>(4+slot);
+                    ++ordinal;
+                }
+                mm.End();
+            }
+        }
+    }
+    if ASCEND_IS_AIV {
+        AscendC::TBuf<AscendC::TPosition::VECCALC> cb,rb,mb,sw,so;
+        pipe.InitBuffer(cb,bm*bn*sizeof(float));
+        pipe.InitBuffer(rb,TILE_M*2*sizeof(float));
+        pipe.InitBuffer(mb,TILE_M*2*sizeof(float));
+        pipe.InitBuffer(sw,TILE_M*sizeof(float)); pipe.InitBuffer(so,32);
+        auto sumWork=sw.Get<float>(), sumOne=so.Get<float>();
+        auto local=cb.Get<float>(), reduced=rb.Get<float>(), maxima=mb.Get<float>();
+        for(int64_t chunk=core;chunk<chunkCount;chunk+=usedCores) {
+            const int64_t rowChunk=chunk/nShards;
+            const int64_t m0=(rowChunk%mChunks)*bm;
+            const int32_t validM=static_cast<int32_t>((M-m0<bm)?M-m0:bm);
+            AscendC::Duplicate(maxima,BmmmsStarter::FloatFromBits(0xff800000u),TILE_M*2);
+            AscendC::Duplicate(reduced,BmmmsStarter::FloatFromBits(0xff800000u),TILE_M*2);
+            AscendC::PipeBarrier<PIPE_V>();
+            const int64_t tileCount=(N+bn-1)/bn;
+            const int64_t shard=chunk%nShards;
+            const int64_t tileBegin=shard*tileCount/nShards;
+            const int64_t tileEnd=(shard+1)*tileCount/nShards;
+            for(int64_t nt=tileBegin;nt<tileEnd;++nt) {
+                const int64_t n0=nt*bn;
+                const int32_t slot=ordinal%2;
+                AscendC::CrossCoreWaitFlag<2>(4+slot);
+                const int32_t validN=static_cast<int32_t>((N<bn)?N:bn);
+                const int32_t rowStride=(validN<bn)?((validN+7)/8)*8:bn;
+                if(validN<bn) {
+                    AscendC::DataCopyExtParams cp{static_cast<uint16_t>(validM),
+                        static_cast<uint32_t>(validN*4),0,0,0};
+                    AscendC::DataCopyPadExtParams<float> pad{true,0,
+                        static_cast<uint8_t>(rowStride-validN),0.0f};
+                    AscendC::DataCopyPad(local,myTile[slot*bm*bn],cp,pad);
+                } else AscendC::DataCopy(local,myTile[slot*bm*bn],validM*bn);
+                AscendC::CrossCoreSetFlag<2,PIPE_MTE2>(6+slot);
+                ++ordinal;
+                auto e=pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(e);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(e);
+                const int32_t segments=(validN+63)/64;
+                for(int32_t s=0;s<segments;++s) {
+                    const int32_t width=(validN-s*64<64)?validN-s*64:64;
+                    for(int32_t r0=0;r0<validM;r0+=128) {
+                        const int32_t rows=(validM-r0<128)?validM-r0:128;
+                        AscendC::WholeReduceMax(reduced[r0],local[r0*rowStride+s*64],width,
+                            rows,1,1,rowStride/8,AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+                    }
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Max(maxima,maxima,reduced,validM);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                auto ev=pipe.FetchEventID<AscendC::HardEvent::V_MTE2>();
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ev);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ev);
+            }
+            if(nShards==1) {
+                AscendC::ReduceSum(sumOne,maxima,sumWork,validM);
+                auto e=pipe.FetchEventID<AscendC::HardEvent::V_S>();
+                AscendC::SetFlag<AscendC::HardEvent::V_S>(e);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(e);
+                chunks.SetValue(chunk*SLOT,sumOne.GetValue(0));
+            } else {
+                auto e=pipe.FetchEventID<AscendC::HardEvent::V_MTE3>();
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(e);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(e);
+                AscendC::DataCopy(chunks[chunk*bm],maxima,bm);
+                auto done=pipe.FetchEventID<AscendC::HardEvent::MTE3_V>();
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(done);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(done);
+            }
+        }
+        AscendC::DataCacheCleanAndInvalid<float,AscendC::CacheLine::ENTIRE_DATA_CACHE,
+            AscendC::DcciDst::CACHELINE_OUT>(chunks);
+    }
+    if(usedCores>1) AscendC::SyncAll();
+    if ASCEND_IS_AIV {
+        if(core==0) {
+            AscendC::TBuf<AscendC::TPosition::VECCALC> allBuf,mergeBuf,workBuf,resultBuf;
+            AscendC::LocalTensor<float> all,merged,work,one;
+            if(nShards>1) {
+                pipe.InitBuffer(allBuf,chunkCount*bm*sizeof(float));
+                pipe.InitBuffer(mergeBuf,bm*sizeof(float));
+                pipe.InitBuffer(workBuf,bm*sizeof(float));
+                pipe.InitBuffer(resultBuf,32);
+                all=allBuf.Get<float>(); merged=mergeBuf.Get<float>();
+                work=workBuf.Get<float>(); one=resultBuf.Get<float>();
+                AscendC::DataCopy(all,chunks,chunkCount*bm);
+                auto e=pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(e);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(e);
+            }
+            if(nShards==1) {
+                pipe.InitBuffer(allBuf,mChunks*8*sizeof(float));
+                pipe.InitBuffer(workBuf,((mChunks*8+63)/64)*256);
+                pipe.InitBuffer(resultBuf,32);
+                all=allBuf.Get<float>(); work=workBuf.Get<float>(); one=resultBuf.Get<float>();
+            }
+            for(int64_t b=0;b<B;++b) {
+                float sum=0.0f,correction=0.0f;
+                if(nShards==1) {
+                    AscendC::DataCopyExtParams cp{static_cast<uint16_t>(mChunks),4,
+                        static_cast<uint32_t>((SLOT-1)*sizeof(float)),0,0};
+                    AscendC::DataCopyPadExtParams<float> pad{true,0,7,0.0f};
+                    AscendC::DataCopyPad(all,chunks[b*mChunks*SLOT],cp,pad);
+                    auto ready=pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ready);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ready);
+                    AscendC::ReduceSum(one,all,work,mChunks*8);
+                    auto readyS=pipe.FetchEventID<AscendC::HardEvent::V_S>();
+                    AscendC::SetFlag<AscendC::HardEvent::V_S>(readyS);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_S>(readyS);
+                    sum=one.GetValue(0);
+                }
+                for(int64_t mc=0;nShards>1 && mc<mChunks;++mc) {
+                    {
+                        const int64_t base=(b*mChunks+mc)*nShards*bm;
+                        AscendC::Adds(merged,all[base],0.0f,bm);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        for(int64_t s=1;s<nShards;++s) {
+                            AscendC::Max(merged,merged,all[base+s*bm],bm);
+                            AscendC::PipeBarrier<PIPE_V>();
+                        }
+                        const int32_t validM=static_cast<int32_t>((M-mc*bm<bm)?M-mc*bm:bm);
+                        AscendC::ReduceSum(one,merged,work,validM);
+                        auto e=pipe.FetchEventID<AscendC::HardEvent::V_S>();
+                        AscendC::SetFlag<AscendC::HardEvent::V_S>(e);
+                        AscendC::WaitFlag<AscendC::HardEvent::V_S>(e);
+                        BmmmsStarter::Accumulate(one.GetValue(0),sum,correction);
+                    }
+                }
+                output.SetValue(b,sum);
+            }
+            AscendC::DataCacheCleanAndInvalid<float,AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                AscendC::DcciDst::CACHELINE_OUT>(output);
+        }
+    }
+}
+template<typename Input, bool TransAp, bool TransBp>
+__global__ __aicore__ void bmmms_narrow_kernel(
+    GM_ADDR x1, GM_ADDR x2, GM_ADDR y, GM_ADDR chunkStorage,
+    __kfc_workspace__ GM_ADDR workspace, GM_ADDR tilingGm,
+    int64_t B, int64_t M, int64_t N, int64_t K,
+    int64_t mChunks, int64_t chunkCount, int64_t usedCores, int64_t width)
+{
+    TCubeTiling tiling;
+    CopyTiling(tiling, tilingGm);
+    AscendC::TPipe pipe;
+    AscendC::GlobalTensor<Input> aGm;
+    AscendC::GlobalTensor<Input> bGm;
+    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<float> chunkGm;
+    aGm.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x1), B * M * K);
+    bGm.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x2), B * K * N);
+    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), B);
+    chunkGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(chunkStorage),
+                            chunkCount * SLOT);
+
+    Matmul<MatmulType<AscendC::TPosition::GM, CubeFormat::ND, Input, TransAp>,
+           MatmulType<AscendC::TPosition::GM, CubeFormat::ND, Input, TransBp>,
+           MatmulType<AscendC::TPosition::VECIN, CubeFormat::ND, float>> mm;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &tiling);
+
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> cQueue;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> accBuffer;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> workBuffer;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> resultBuffer;
+    const int32_t bmP = tiling.baseM;
+    const int32_t bnP = tiling.baseN;
+    pipe.InitBuffer(cQueue, 1, bmP * bnP * sizeof(float));
+    pipe.InitBuffer(accBuffer, bnP * sizeof(float));
+    pipe.InitBuffer(workBuffer, bnP * sizeof(float));
+    pipe.InitBuffer(resultBuffer, 32);
+    auto acc = accBuffer.Get<float>();
+    auto work = workBuffer.Get<float>();
+    auto result = resultBuffer.Get<float>();
+
+    const int64_t coreIdx = AscendC::GetBlockIdx();
+    const bool active = (bnP == width && bmP >= N && N >= 1 && bnP >= 1 &&
+                         bnP <= TILE_N && width <= M &&
+                         coreIdx >= 0 && coreIdx < usedCores);
+
+    for (int64_t chunk = active ? coreIdx : chunkCount; chunk < chunkCount;
+         chunk += usedCores) {
+        const int64_t batch = chunk / mChunks;
+        const int64_t m0Raw = (chunk % mChunks) * width;
+        const int32_t fresh = static_cast<int32_t>((M - m0Raw < width) ? (M - m0Raw) : width);
+        const int64_t m0 = (m0Raw + width <= M) ? m0Raw : (M - width);
+        const int32_t skip = static_cast<int32_t>(width) - fresh;
+        const int64_t apOffset = batch * K * N;
+        const int64_t bpOffset = batch * M * K + (TransBp ? m0 * K : m0);
+        mm.SetOrgShape(static_cast<int32_t>(N), static_cast<int32_t>(M),
+                       static_cast<int32_t>(K), static_cast<int32_t>(K));
+        mm.SetTensorA(bGm[apOffset], TransAp);
+        mm.SetTensorB(aGm[bpOffset], TransBp);
+        mm.SetTail(static_cast<int32_t>(N), static_cast<int32_t>(width),
+                   static_cast<int32_t>(K));
+        float chunkSum = 0.0f;
+        float chunkCorrection = 0.0f;
+        while (mm.template Iterate<true>()) {
+            auto cLocal = cQueue.AllocTensor<float>();
+            mm.template GetTensorC<true>(cLocal, false, true);
+            cQueue.EnQue(cLocal);
+            cLocal = cQueue.DeQue<float>();
+            AscendC::Adds(acc, cLocal, 0.0f, static_cast<int32_t>(width));
+            AscendC::PipeBarrier<PIPE_V>();
+            for (int64_t n = 1; n < N; ++n) {
+                AscendC::Max(acc, acc, cLocal[n * width], static_cast<int32_t>(width));
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            if (skip > 0) {
+                AscendC::Duplicate(acc, 0.0f, skip);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::ReduceSum(result, acc, work, static_cast<int32_t>(width));
+            auto ev = pipe.FetchEventID<AscendC::HardEvent::V_S>();
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(ev);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(ev);
+            BmmmsStarter::Accumulate(result.GetValue(0), chunkSum, chunkCorrection);
+            cQueue.FreeTensor(cLocal);
+        }
+        mm.End();
+        chunkGm.SetValue(chunk * SLOT, chunkSum);
+    }
+
+    AscendC::DataCacheCleanAndInvalid<float,
+        AscendC::CacheLine::ENTIRE_DATA_CACHE,
+        AscendC::DcciDst::CACHELINE_OUT>(chunkGm);
+    AscendC::SyncAll();
+
+    if (coreIdx != 0 || !active) {
+        return;
+    }
+    for (int64_t batch = 0; batch < B; ++batch) {
+        float batchSum = 0.0f;
+        float batchCorrection = 0.0f;
+        for (int64_t mc = 0; mc < mChunks; ++mc) {
+            const float value = chunkGm.GetValue((batch * mChunks + mc) * SLOT);
+            BmmmsStarter::Accumulate(value, batchSum, batchCorrection);
+        }
+        yGm.SetValue(batch, batchSum);
+    }
+    AscendC::DataCacheCleanAndInvalid<float,
+        AscendC::CacheLine::ENTIRE_DATA_CACHE,
+        AscendC::DcciDst::CACHELINE_OUT>(yGm);
+}
+
+template<typename Input>
+inline void LaunchNarrow(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, GM_ADDR chunk,
+                         GM_ADDR workspace, GM_ADDR tiling, aclrtStream stream,
+                         int64_t B, int64_t M, int64_t N, int64_t K,
+                         int64_t mChunks, int64_t chunkCount, int64_t cores,
+                         int64_t width, bool ta, bool tb)
+{
+    if (!tb) {
+        if (!ta) {
+            bmmms_narrow_kernel<Input, true, true><<<cores, nullptr, stream>>>(
+                x1, x2, y, chunk, workspace, tiling, B, M, N, K,
+                mChunks, chunkCount, cores, width);
+        } else {
+            bmmms_narrow_kernel<Input, true, false><<<cores, nullptr, stream>>>(
+                x1, x2, y, chunk, workspace, tiling, B, M, N, K,
+                mChunks, chunkCount, cores, width);
+        }
+    } else if (!ta) {
+        bmmms_narrow_kernel<Input, false, true><<<cores, nullptr, stream>>>(
+            x1, x2, y, chunk, workspace, tiling, B, M, N, K,
+            mChunks, chunkCount, cores, width);
+    } else {
+        bmmms_narrow_kernel<Input, false, false><<<cores, nullptr, stream>>>(
+            x1, x2, y, chunk, workspace, tiling, B, M, N, K,
+            mChunks, chunkCount, cores, width);
+    }
+}
+
+template<typename Input>
+inline void Launch(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, GM_ADDR tile, GM_ADDR chunk,
+                   GM_ADDR workspace, GM_ADDR tiling, GM_ADDR paddedA, GM_ADDR paddedB, GM_ADDR packingMap, int64_t packingRows, aclrtStream stream,
+                   int64_t B, int64_t M, int64_t N, int64_t K,
+                   int64_t mChunks, int64_t chunkCount, int64_t cores,
+                   int64_t tileStride, int64_t nShards, bool ta, bool tb)
+{
+    if (ta) {
+        if (tb) {
+            bmmms_cube_kernel<Input, true, true><<<cores, nullptr, stream>>>(
+                x1, x2, y, tile, chunk, workspace, tiling, paddedA, paddedB, packingMap, packingRows, B, M, N, K,
+                mChunks, chunkCount, cores, tileStride, nShards);
+        } else {
+            bmmms_cube_kernel<Input, true, false><<<cores, nullptr, stream>>>(
+                x1, x2, y, tile, chunk, workspace, tiling, paddedA, paddedB, packingMap, packingRows, B, M, N, K,
+                mChunks, chunkCount, cores, tileStride, nShards);
+        }
+    } else if (tb) {
+        bmmms_cube_kernel<Input, false, true><<<cores, nullptr, stream>>>(
+            x1, x2, y, tile, chunk, workspace, tiling, paddedA, paddedB, packingMap, packingRows, B, M, N, K,
+            mChunks, chunkCount, cores, tileStride, nShards);
+    } else {
+        bmmms_cube_kernel<Input, false, false><<<cores, nullptr, stream>>>(
+            x1, x2, y, tile, chunk, workspace, tiling, paddedA, paddedB, packingMap, packingRows, B, M, N, K,
+            mChunks, chunkCount, cores, tileStride, nShards);
+    }
+}
+inline bool AttemptTiling(const platform_ascendc::PlatformAscendC& platform,
+                          int32_t dtype, bool ta, bool tb,
+                          int64_t M, int64_t N, int64_t K,
+                          int32_t bm, int32_t bn,
+                          std::vector<uint8_t>& serialized)
+{
+    matmul_tiling::MatmulApiTiling tiler(platform);
+    const auto inputType = dtype == 1 ? matmul_tiling::DataType::DT_FLOAT16 :
+                                       matmul_tiling::DataType::DT_BF16;
+    tiler.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, inputType, ta);
+    tiler.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, inputType, tb);
+    tiler.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT);
+    const bool padEligible=K>=1024 && K%16==0 && M>=16 && N>=16;
+    const int64_t pitchM=(padEligible && ta)?((M+15)/16)*16:M;
+    const int64_t pitchN=(padEligible && !tb)?((N+15)/16)*16:N;
+    tiler.SetOrgShape(static_cast<int32_t>(pitchM),static_cast<int32_t>(pitchN),static_cast<int32_t>(K));
+    const int32_t sessionN = (N % bn == 0) ? static_cast<int32_t>(N) : bn;
+    tiler.SetShape(bm, static_cast<int32_t>(N), static_cast<int32_t>(K));
+    if (tiler.SetFixSplit(bm, bn, -1) != 0) {
+        return false;
+    }
+    tiler.SetBias(false);
+    tiler.SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling hostTiling;
+    if (tiler.GetTiling(hostTiling) < 0) {
+        return false;
+    }
+    const size_t bytes = hostTiling.GetDataSize();
+    if (bytes < sizeof(TCubeTiling)) {
+        return false;
+    }
+    serialized.assign(bytes, 0);
+    hostTiling.SaveToBuffer(serialized.data(), bytes);
+    const TCubeTiling* resolved = reinterpret_cast<const TCubeTiling*>(serialized.data());
+    return resolved->baseM == bm && resolved->baseN == bn;
+}
+inline bool TryRun(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, aclrtStream stream,
+                   int64_t B, int64_t M, int64_t N, int64_t K,
+                   int32_t dtype, bool ta, bool tb, int64_t availableCoreNum)
+{
+    const int32_t boundedN = (N < TILE_N) ? static_cast<int32_t>(N) : TILE_N;
+    int32_t maxN = (N < BLOCK) ? BLOCK : (boundedN / BLOCK) * BLOCK;
+    if(K>=2048 && N>=128 && B*((M+63)/64)<=availableCoreNum/2 && maxN>64) maxN=64;
+    if (maxN < BLOCK) {
+        return false;
+    }
+    const int32_t roundedM = static_cast<int32_t>(((M + BLOCK - 1) / BLOCK) * BLOCK);
+    int32_t boundM=64;
+    const int64_t coarseTasks=B*((M+63)/64)*((N+255)/256);
+    if(K>=1024 && N<=64 && !ta && tb && coarseTasks<availableCoreNum) {
+        boundM=BLOCK;
+        const int64_t rowTasks=B*((M+BLOCK-1)/BLOCK);
+        int64_t wantedN=availableCoreNum/rowTasks;
+        if(wantedN<1) wantedN=1;
+        const int64_t columns=(N+wantedN-1)/wantedN;
+        const int32_t preferredN=static_cast<int32_t>(((columns+BLOCK-1)/BLOCK)*BLOCK);
+        if(preferredN<maxN) maxN=preferredN;
+    } else if(N<=64 && M>=128) {
+        const int64_t target=(B*M+availableCoreNum-1)/availableCoreNum;
+        boundM=static_cast<int32_t>(((target+BLOCK-1)/BLOCK)*BLOCK);
+        if(boundM<64) boundM=64;
+        if(boundM>TILE_M) boundM=TILE_M;
+        const int32_t memoryBound=(32768/maxN/BLOCK)*BLOCK;
+        if(boundM>memoryBound) boundM=memoryBound;
+    }
+    const int32_t maxM=(roundedM<boundM)?roundedM:boundM;
+
+    const char* socName = aclrtGetSocName();
+    if (socName == nullptr) {
+        return false;
+    }
+    auto platform = platform_ascendc::PlatformAscendCManager::GetInstance(socName);
+    if (platform == nullptr) {
+        return false;
+    }
+    std::vector<uint8_t> serialized;
+    int32_t baseM = 0;
+    int32_t baseN = 0;
+    for (int32_t m = maxM; m >= BLOCK && baseM == 0; m -= BLOCK) {
+        for (int32_t n = maxN; n >= BLOCK; n -= BLOCK) {
+            if (AttemptTiling(*platform, dtype, ta, tb, M, N, K, m, n, serialized)) {
+                baseM = m;
+                baseN = n;
+                break;
+            }
+        }
+    }
+    if (baseM == 0) {
+        return false;
+    }
+    const size_t tilingBytes = serialized.size();
+    const int64_t mChunks = (M + baseM - 1) / baseM;
+    const int64_t rowChunks = B * mChunks;
+    const int64_t nTiles = (N + baseN - 1) / baseN;
+    const int64_t spareGroups = availableCoreNum / rowChunks;
+    const int64_t wantedShards = (spareGroups > 0) ? spareGroups : 1;
+    const int64_t nShards = (nTiles < wantedShards) ? nTiles : wantedShards;
+    const int64_t chunkCount = rowChunks * nShards;
+    int64_t cores = availableCoreNum < chunkCount ? availableCoreNum : chunkCount;
+    if (cores < 1) {
+        cores = 1;
+    }
+    const int64_t tileStride = static_cast<int64_t>(baseM) * baseN * 2;
+
+    const size_t systemBytes = static_cast<size_t>(platform->GetLibApiWorkSpaceSize());
+    const size_t tilingOffset = (systemBytes + 511u) & ~size_t(511u);
+    const size_t tileOffset = (tilingOffset + tilingBytes + 511u) & ~size_t(511u);
+    const size_t tileBytes = static_cast<size_t>(cores) * tileStride * sizeof(float);
+    const size_t chunkOffset = (tileOffset + tileBytes + 511u) & ~size_t(511u);
+    const size_t chunkBytes = static_cast<size_t>(chunkCount) * ((nShards > 1) ? baseM : SLOT) * sizeof(float);
+    const bool padEligible=K>=1024 && K%16==0 && M>=16 && N>=16;
+    const bool packA=padEligible && ta && M%16!=0;
+    const bool packB=padEligible && !tb && N%16!=0;
+    const size_t packAOffset=(chunkOffset+chunkBytes+511u)&~size_t(511u);
+    const size_t packABytes=packA?static_cast<size_t>(B*K*((M+15)/16)*16*2):0;
+    const size_t packBOffset=(packAOffset+packABytes+511u)&~size_t(511u);
+    const size_t packBBytes=packB?static_cast<size_t>(B*K*((N+15)/16)*16*2):0;
+    const int64_t aw=packA?((M+15)/16)*16:0,bw=packB?((N+15)/16)*16:0;
+    const int64_t widest=(aw>bw)?aw:bw;
+    int64_t packingRows=widest?16384/widest:1;
+    if(packingRows>2048) packingRows=2048;
+    const int64_t mapCount=packingRows*(aw+bw);
+    std::vector<uint32_t> packingIndices(static_cast<size_t>(mapCount));
+    for(int which=0;which<2;++which) {
+        const int64_t pitch=which?bw:aw,width=which?N:M;
+        if(!pitch) continue;
+        const int64_t base=which?packingRows*aw:0;
+        for(int64_t r=0;r<packingRows;++r) for(int64_t c=0;c<pitch;++c)
+            packingIndices[base+r*pitch+c]=static_cast<uint32_t>(
+                ((c<width)?r*width+c:packingRows*widest)*2);
+    }
+    const size_t packingMapOffset=(packBOffset+packBBytes+511u)&~size_t(511u);
+    const size_t packingMapBytes=static_cast<size_t>(mapCount)*sizeof(uint32_t);
+    const size_t totalBytes=packingMapOffset+packingMapBytes;
+    uint8_t* storage = nullptr;
+    if (aclrtMalloc(reinterpret_cast<void**>(&storage), totalBytes,
+                    ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+        return false;
+    }
+    if (aclrtMemset(storage, totalBytes, 0, totalBytes) != ACL_SUCCESS) {
+        aclrtFree(storage);
+        return false;
+    }
+    uint8_t* tilingDevice = storage + tilingOffset;
+    uint8_t* tileDevice = storage + tileOffset;
+    uint8_t* chunkDevice = storage + chunkOffset;
+    uint8_t* paddedADevice=packA?storage+packAOffset:nullptr;
+    uint8_t* paddedBDevice=packB?storage+packBOffset:nullptr;
+    if (aclrtMemcpy(tilingDevice, tilingBytes, serialized.data(), tilingBytes,
+                    ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+        aclrtFree(storage);
+        return false;
+    }
+    if(packingMapBytes>0 && aclrtMemcpy(storage+packingMapOffset,packingMapBytes,
+        packingIndices.data(),packingMapBytes,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS) {
+        aclrtFree(storage); return false;
+    }
+    if (dtype == 1) {
+        Launch<half>(x1, x2, y, tileDevice, chunkDevice, storage, tilingDevice, paddedADevice, paddedBDevice, storage+packingMapOffset, packingRows, stream,
+                     B, M, N, K, mChunks, chunkCount, cores, tileStride, nShards, ta, tb);
+    } else {
+        Launch<bfloat16_t>(x1, x2, y, tileDevice, chunkDevice, storage, tilingDevice, paddedADevice, paddedBDevice, storage+packingMapOffset, packingRows, stream,
+                           B, M, N, K, mChunks, chunkCount, cores, tileStride, nShards, ta, tb);
+    }
+    if (aclrtSynchronizeStreamWithTimeout(stream, 3000) == ACL_SUCCESS) {
+        aclrtFree(storage);
+    }
+    return true;
+}
+inline bool AttemptNarrowTiling(const platform_ascendc::PlatformAscendC& platform,
+                                int32_t dtype, bool transAp, bool transBp,
+                                int64_t M, int64_t N, int64_t K, int32_t width,
+                                std::vector<uint8_t>& serialized)
+{
+    matmul_tiling::MatmulApiTiling tiler(platform);
+    const auto inputType = dtype == 1 ? matmul_tiling::DataType::DT_FLOAT16 :
+                                       matmul_tiling::DataType::DT_BF16;
+    tiler.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                   inputType, transAp);
+    tiler.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                   inputType, transBp);
+    tiler.SetCType(matmul_tiling::TPosition::VECIN, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT);
+    tiler.SetOrgShape(static_cast<int32_t>(N), static_cast<int32_t>(M),
+                      static_cast<int32_t>(K));
+    tiler.SetShape(BLOCK, width, static_cast<int32_t>(K));
+    if (tiler.SetFixSplit(BLOCK, width, -1) != 0) {
+        return false;
+    }
+    tiler.SetBias(false);
+    tiler.SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling hostTiling;
+    if (tiler.GetTiling(hostTiling) < 0) {
+        return false;
+    }
+    const size_t bytes = hostTiling.GetDataSize();
+    if (bytes < sizeof(TCubeTiling)) {
+        return false;
+    }
+    serialized.assign(bytes, 0);
+    hostTiling.SaveToBuffer(serialized.data(), bytes);
+    const TCubeTiling* resolved = reinterpret_cast<const TCubeTiling*>(serialized.data());
+    return resolved->baseM == BLOCK && resolved->baseN == width;
+}
+inline bool TryRunNarrow(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, aclrtStream stream,
+                         int64_t B, int64_t M, int64_t N, int64_t K,
+                         int32_t dtype, bool ta, bool tb, int64_t availableCoreNum)
+{
+    const bool transAp = !tb;
+    const bool transBp = !ta;
+    const char* socName = aclrtGetSocName();
+    if (socName == nullptr) {
+        return false;
+    }
+    auto platform = platform_ascendc::PlatformAscendCManager::GetInstance(socName);
+    if (platform == nullptr) {
+        return false;
+    }
+    int32_t maxWidth = static_cast<int32_t>((M / BLOCK) * BLOCK);
+    if (maxWidth > TILE_N) {
+        maxWidth = TILE_N;
+    }
+    if (maxWidth < BLOCK) {
+        return false;
+    }
+    const int64_t perCore = (M + availableCoreNum - 1) / availableCoreNum;
+    int32_t wanted = static_cast<int32_t>(((perCore + BLOCK - 1) / BLOCK) * BLOCK);
+    if (wanted < BLOCK) {
+        wanted = BLOCK;
+    }
+    if (wanted > maxWidth) {
+        wanted = maxWidth;
+    }
+    std::vector<uint8_t> serialized;
+    int32_t width = 0;
+    for (int32_t candidate = wanted; candidate >= BLOCK; candidate -= BLOCK) {
+        if (AttemptNarrowTiling(*platform, dtype, transAp, transBp, M, N, K,
+                                candidate, serialized)) {
+            width = candidate;
+            break;
+        }
+    }
+    if (width == 0) {
+        return false;
+    }
+    const size_t tilingBytes = serialized.size();
+
+    const int64_t mChunks = (M + width - 1) / width;
+    const int64_t chunkCount = B * mChunks;
+    int64_t cores = availableCoreNum < chunkCount ? availableCoreNum : chunkCount;
+    if (cores < 1) {
+        cores = 1;
+    }
+
+    const size_t systemBytes = static_cast<size_t>(platform->GetLibApiWorkSpaceSize());
+    const size_t tilingOffset = (systemBytes + 511u) & ~size_t(511u);
+    const size_t chunkOffset = (tilingOffset + tilingBytes + 511u) & ~size_t(511u);
+    const size_t chunkBytes = static_cast<size_t>(chunkCount) * SLOT * sizeof(float);
+    const size_t totalBytes = chunkOffset + chunkBytes;
+    uint8_t* storage = nullptr;
+    if (aclrtMalloc(reinterpret_cast<void**>(&storage), totalBytes,
+                    ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+        return false;
+    }
+    if (aclrtMemset(storage, totalBytes, 0, totalBytes) != ACL_SUCCESS) {
+        aclrtFree(storage);
+        return false;
+    }
+    uint8_t* tilingDevice = storage + tilingOffset;
+    uint8_t* chunkDevice = storage + chunkOffset;
+    if (aclrtMemcpy(tilingDevice, tilingBytes, serialized.data(), tilingBytes,
+                    ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+        aclrtFree(storage);
+        return false;
+    }
+    if (dtype == 1) {
+        LaunchNarrow<half>(x1, x2, y, chunkDevice, storage, tilingDevice, stream,
+                           B, M, N, K, mChunks, chunkCount, cores, width, ta, tb);
+    } else {
+        LaunchNarrow<bfloat16_t>(x1, x2, y, chunkDevice, storage, tilingDevice, stream,
+                                 B, M, N, K, mChunks, chunkCount, cores, width, ta, tb);
+    }
+    if (aclrtSynchronizeStreamWithTimeout(stream, 3000) == ACL_SUCCESS) {
+        aclrtFree(storage);
+    }
+    return true;
+}
+
+} // namespace BmmmsCube
+
+
+namespace BmmmsRows {
+
+template<typename Input>
+__global__ __aicore__ void row_vector_kernel(
+    GM_ADDR x1,GM_ADDR x2,GM_ADDR y,GM_ADDR indexMap,int64_t B,
+    int32_t M,int32_t N,int32_t K,bool ta,bool tb)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,1> aq,bq;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> afb,bfb,arb,brb,mapab,mapbb;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> pb,db,sb,mb,wb,ob,tbBuf;
+    const int32_t mk=M*K,nk=N*K;
+    const bool packA=ta && M>1,packB=!tb && N>1;
+    const bool trans=M>N;
+    const int32_t rows=trans?N:M,width=trans?M:N;
+    const int32_t paddedWidth=((width+7)/8)*8;
+    pipe.InitBuffer(aq,1,((mk+15)/16)*32); pipe.InitBuffer(bq,1,((nk+15)/16)*32);
+    pipe.InitBuffer(afb,mk*4); pipe.InitBuffer(bfb,nk*4);
+    auto af=afb.Get<float>(),bf=bfb.Get<float>();
+    auto ar=af,br=bf;
+    AscendC::LocalTensor<uint32_t> ma,mbIdx;
+    AscendC::GlobalTensor<uint32_t> maps;
+    if(packA || packB) maps.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(indexMap),
+        (packA?mk:0)+(packB?nk:0));
+    if(packA) {
+        pipe.InitBuffer(arb,mk*4); pipe.InitBuffer(mapab,mk*4);
+        ar=arb.Get<float>(); ma=mapab.Get<uint32_t>();
+        AscendC::DataCopy(ma,maps,mk);
+    }
+    if(packB) {
+        pipe.InitBuffer(brb,nk*4); pipe.InitBuffer(mapbb,nk*4);
+        br=brb.Get<float>(); mbIdx=mapbb.Get<uint32_t>();
+        AscendC::DataCopy(mbIdx,maps[packA?mk:0],nk);
+    }
+    if(packA || packB) {
+        auto e=pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(e);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(e);
+    }
+    pipe.InitBuffer(pb,width*K*4);
+    pipe.InitBuffer(db,paddedWidth*4); pipe.InitBuffer(sb,paddedWidth*4);
+    pipe.InitBuffer(mb,paddedWidth*4); pipe.InitBuffer(wb,((width+63)/64)*256);
+    pipe.InitBuffer(ob,32); pipe.InitBuffer(tbBuf,32);
+    auto product=pb.Get<float>(),dots=db.Get<float>(),part=sb.Get<float>();
+    auto maxima=mb.Get<float>(),work=wb.Get<float>(),one=ob.Get<float>(),total=tbBuf.Get<float>();
+    AscendC::GlobalTensor<Input> ag,bg;
+    AscendC::GlobalTensor<float> yg;
+    ag.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x1),B*mk);
+    bg.SetGlobalBuffer(reinterpret_cast<__gm__ Input*>(x2),B*nk);
+    yg.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y),B);
+    AscendC::DataCopyExtParams ac{1,static_cast<uint32_t>(mk*2),0,0,0};
+    AscendC::DataCopyExtParams bc{1,static_cast<uint32_t>(nk*2),0,0,0};
+    AscendC::DataCopyPadExtParams<Input> pad{false,0,0,0};
+    AscendC::UnaryRepeatParams replicate{1,1,static_cast<uint8_t>(K/8),0};
+    for(int64_t b=AscendC::GetBlockIdx();b<B;b+=AscendC::GetBlockNum()) {
+        auto al=aq.AllocTensor<Input>(),bl=bq.AllocTensor<Input>();
+        AscendC::DataCopyPad(al,ag[b*mk],ac,pad); AscendC::DataCopyPad(bl,bg[b*nk],bc,pad);
+        aq.EnQue(al); bq.EnQue(bl); al=aq.DeQue<Input>(); bl=bq.DeQue<Input>();
+        AscendC::Cast(af,al,AscendC::RoundMode::CAST_NONE,mk);
+        AscendC::Cast(bf,bl,AscendC::RoundMode::CAST_NONE,nk);
+        AscendC::PipeBarrier<PIPE_V>();
+        if(packA) AscendC::Gather(ar,af,ma,0,mk);
+        if(packB) AscendC::Gather(br,bf,mbIdx,0,nk);
+        AscendC::PipeBarrier<PIPE_V>();
+        for(int32_t row=0;row<rows;++row) {
+            auto source=trans?br[row*K]:ar[row*K];
+            auto matrix=trans?ar:br;
+            for(int32_t k0=0;k0<K;k0+=64) {
+                const int32_t mask=(K-k0<64)?K-k0:64;
+                for(int32_t r0=0;r0<width;r0+=128) {
+                    const int32_t repeats=(width-r0<128)?width-r0:128;
+                    AscendC::Adds(product[r0*K+k0],source[k0],0.0f,
+                        static_cast<uint64_t>(mask),static_cast<uint8_t>(repeats),replicate);
+                }
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(product,product,matrix,width*K);
+            AscendC::PipeBarrier<PIPE_V>();
+            for(int32_t k0=0;k0<K;k0+=64) {
+                const int32_t mask=(K-k0<64)?K-k0:64;
+                for(int32_t r0=0;r0<width;r0+=128) {
+                    const int32_t repeats=(width-r0<128)?width-r0:128;
+                    AscendC::WholeReduceSum(part[r0],product[r0*K+k0],mask,repeats,1,1,K/8);
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+                if(k0==0) AscendC::Adds(dots,part,0.0f,width);
+                else AscendC::Add(dots,dots,part,width);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            if(trans) {
+                if(rows>1) {
+                    if(row==0) AscendC::Adds(maxima,dots,0.0f,width);
+                    else AscendC::Max(maxima,maxima,dots,width);
+                }
+            } else {
+                AscendC::ReduceMax(one,dots,work,width,false);
+                AscendC::PipeBarrier<PIPE_V>();
+                if(rows>1) {
+                    if(row==0) AscendC::Adds(total,one,0.0f,1);
+                    else AscendC::Add(total,total,one,1);
+                }
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        if(trans) AscendC::ReduceSum(one,(rows==1)?dots:maxima,work,width);
+        auto answer=(trans || rows==1)?one:total;
+        if(B==1) {
+            auto e=pipe.FetchEventID<AscendC::HardEvent::V_S>();
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(e);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(e);
+            yg.SetValue(b,answer.GetValue(0));
+        } else {
+            auto e=pipe.FetchEventID<AscendC::HardEvent::V_MTE3>();
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(e);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(e);
+            AscendC::DataCopyExtParams cpOut{1,4,0,0,0};
+            AscendC::DataCopyPad(yg[b],answer,cpOut);
+            auto done=pipe.FetchEventID<AscendC::HardEvent::MTE3_V>();
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(done);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(done);
+        }
+        aq.FreeTensor(al); bq.FreeTensor(bl);
+    }
+    if(B==1) AscendC::DataCacheCleanAndInvalid<float,AscendC::CacheLine::ENTIRE_DATA_CACHE,
+        AscendC::DcciDst::CACHELINE_OUT>(yg);
+}
+
+inline bool TryRun(GM_ADDR x1,GM_ADDR x2,GM_ADDR y,aclrtStream stream,
+    int64_t B,int64_t M,int64_t N,int64_t K,int32_t dtype,bool ta,bool tb,int64_t availableCoreNum)
+{
+    if(K>512 || M>512 || N>512) return false;
+    const int64_t width=(M>N)?M:N,rows=(M<N)?M:N;
+    const int64_t cores=(B<availableCoreNum)?B:availableCoreNum;
+    if(((B+cores-1)/cores)*rows*((K+63)/64)>32) return false;
+    const bool packA=ta && M>1,packB=!tb && N>1;
+    const int64_t mk=M*K,nk=N*K;
+    const int64_t mapCells=(packA?mk:0)+(packB?nk:0);
+    const int64_t bytesUB=6*(mk+nk)+8*mapCells+4*width*K+20*width+1024;
+    if(bytesUB>180*1024) return false;
+    std::vector<uint32_t> map(static_cast<size_t>(mapCells));
+    if(packA) for(int64_t m=0;m<M;++m) for(int64_t k=0;k<K;++k)
+        map[static_cast<size_t>(m*K+k)]=static_cast<uint32_t>((k*M+m)*4);
+    if(packB) for(int64_t n=0;n<N;++n) for(int64_t k=0;k<K;++k)
+        map[static_cast<size_t>((packA?mk:0)+n*K+k)]=static_cast<uint32_t>((k*N+n)*4);
+    uint8_t* device=nullptr;
+    if(mapCells>0) {
+        const size_t bytes=map.size()*sizeof(uint32_t);
+        if(aclrtMalloc(reinterpret_cast<void**>(&device),bytes,ACL_MEM_MALLOC_HUGE_FIRST)!=ACL_SUCCESS) return false;
+        if(aclrtMemcpy(device,bytes,map.data(),bytes,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS) {
+            aclrtFree(device); return false;
+        }
+    }
+    if(dtype==1) row_vector_kernel<half><<<cores,nullptr,stream>>>(x1,x2,y,device,B,M,N,K,ta,tb);
+    else row_vector_kernel<bfloat16_t><<<cores,nullptr,stream>>>(x1,x2,y,device,B,M,N,K,ta,tb);
+    if(device && aclrtSynchronizeStreamWithTimeout(stream,3000)==ACL_SUCCESS) aclrtFree(device);
+    return true;
+}
+} // namespace BmmmsRows
+
+
+
+
+extern "C" void run_kernel(
+    GM_ADDR x1, const TensorGroupInfo& info_x1,
+    GM_ADDR x2, const TensorGroupInfo& info_x2,
+    GM_ADDR y, const TensorGroupInfo& info_y,
+    int64_t availableCoreNum, aclrtStream stream,
+    bool transposeX1, bool transposeX2)
+{
+    if (!x1 || !x2 || !y || availableCoreNum <= 0 ||
+        !info_x1.tensors || !info_x2.tensors || !info_y.tensors ||
+        info_x1.numTensors != 1 || info_x2.numTensors != 1 || info_y.numTensors != 1) {
+        return;
+    }
+    const TensorInfo& a = info_x1.tensors[0];
+    const TensorInfo& b = info_x2.tensors[0];
+    const TensorInfo& out = info_y.tensors[0];
+    if (!a.shape || !b.shape || !out.shape || a.numDims != 3 ||
+        b.numDims != 3 || out.numDims != 1 ||
+        (a.dtype != 1 && a.dtype != 2) || a.dtype != b.dtype || out.dtype != 0) {
+        return;
+    }
+
+    const int64_t B = a.shape[0];
+    const int64_t M = a.shape[transposeX1 ? 2 : 1];
+    const int64_t K = a.shape[transposeX1 ? 1 : 2];
+    const int64_t K2 = b.shape[transposeX2 ? 2 : 1];
+    const int64_t N = b.shape[transposeX2 ? 1 : 2];
+    if (B < 1 || B > 64 || M < 1 || M > 8192 || N < 1 || N > 8192 ||
+        K < 32 || K > 8192 || K % 8 != 0 || K != K2 ||
+        b.shape[0] != B || out.shape[0] != B ||
+        B * M * K > (int64_t(1) << 26) || B * N * K > (int64_t(1) << 26)) {
+        return;
+    }
+
+    if (M == 1 && N == 1) {
+        const int64_t dotCores=(B<availableCoreNum)?B:availableCoreNum;
+        if (a.dtype == 1) {
+            bmmms_dot_kernel<half><<<dotCores, nullptr, stream>>>(x1, x2, y, B, static_cast<int32_t>(K));
+        } else {
+            bmmms_dot_kernel<bfloat16_t><<<dotCores, nullptr, stream>>>(x1, x2, y, B, static_cast<int32_t>(K));
+        }
+        return;
+    }
+    if(M*N<=4) {
+        const int64_t cores=(B<availableCoreNum)?B:availableCoreNum;
+        if(a.dtype==1) bmmms_tiny_dots_kernel<half><<<cores,nullptr,stream>>>(x1,x2,y,B,M,N,K,transposeX1,transposeX2);
+        else bmmms_tiny_dots_kernel<bfloat16_t><<<cores,nullptr,stream>>>(x1,x2,y,B,M,N,K,transposeX1,transposeX2);
+        return;
+    }
+    const int64_t smallUbBytes = 6 * K * (M + N) + 28 * K + 512;
+    const bool bothNarrow = (M < BmmmsCube::BLOCK && N < BmmmsCube::BLOCK);
+    const bool tinyWork = (M * N <= 32 && B * M * N * K <= 65536);
+    if(M*N<=1024 && ((M<N)?M:N)<=16 && BmmmsRows::TryRun(x1,x2,y,stream,B,M,N,K,a.dtype,transposeX1,transposeX2,availableCoreNum)) return;
+    if ((tinyWork || bothNarrow) && M * N <= 256 && smallUbBytes <= 180 * 1024) {
+        if(bothNarrow && !tinyWork && BmmmsCube::TryRun(x1,x2,y,stream,B,M,N,K,a.dtype,
+            transposeX1,transposeX2,availableCoreNum)) return;
+        if (a.dtype == 1) {
+            bmmms_small_vector_kernel<half><<<1, nullptr, stream>>>(
+                x1, x2, y, B, static_cast<int32_t>(M), static_cast<int32_t>(N),
+                static_cast<int32_t>(K), transposeX1, transposeX2);
+        } else {
+            bmmms_small_vector_kernel<bfloat16_t><<<1, nullptr, stream>>>(
+                x1, x2, y, B, static_cast<int32_t>(M), static_cast<int32_t>(N),
+                static_cast<int32_t>(K), transposeX1, transposeX2);
+        }
+        return;
+    }
+    if (B * M * N * K > 4096 &&
+        BmmmsCube::TryRun(x1, x2, y, stream, B, M, N, K, a.dtype,
+                          transposeX1, transposeX2, availableCoreNum)) {
+        return;
+    }
+    if (N < BmmmsCube::BLOCK && M >= BmmmsCube::BLOCK && B * M * N * K > 4096 &&
+        BmmmsCube::TryRunNarrow(x1, x2, y, stream, B, M, N, K, a.dtype,
+                                transposeX1, transposeX2, availableCoreNum)) {
+        return;
+    }
+    bmmms_starter_kernel<<<1, nullptr, stream>>>(
+        x1, x2, y, B, M, N, K, a.dtype, transposeX1, transposeX2);
+}

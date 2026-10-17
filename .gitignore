@@ -1,0 +1,12 @@
+# 构建产物
+build*/
+*.o
+*.zip
+
+# 本地环境
+.ssh_queue*/
+cases/
+scans/
+
+# 凭据绝不入库
+*known_hosts*
